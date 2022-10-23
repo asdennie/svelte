@@ -5,19 +5,21 @@ export interface StorageOptions<T> {
 	parse?: (value: string) => T;
 	stringify?: (value?: T) => string;
 	defaultValue?: T;
-	storage?: Storage;
+	storage?: (() => undefined | Storage) | Storage;
 }
 export function storageValue<T>({
 	key,
 	defaultValue,
 	stringify = JSON.stringify,
 	parse = JSON.parse,
-	storage = localStorage
+	storage
 }: StorageOptions<T>): Writable<T> {
 	const initial = stringify(defaultValue);
 
+	const finalStorage = typeof storage === 'function' ? storage() : storage;
+
 	const getter = () => {
-		const value = storage?.getItem(key);
+		const value = finalStorage?.getItem(key);
 		if (typeof value !== 'string') return defaultValue;
 		try {
 			return parse(value);
@@ -28,9 +30,9 @@ export function storageValue<T>({
 	const setter = (value: T) => {
 		const stringified = stringify(value);
 		if (stringified === initial) {
-			storage?.removeItem(key);
+			finalStorage?.removeItem(key);
 		} else {
-			storage?.setItem(key, stringified);
+			finalStorage?.setItem(key, stringified);
 		}
 		return value;
 	};

@@ -1,3 +1,3 @@
-export * from './editValue';
-export * from './is';
-export * from './storageValue';
+export * from './editValue.js';
+export * from './is.js';
+export * from './storageValue.js';
