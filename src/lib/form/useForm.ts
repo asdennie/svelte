@@ -14,7 +14,13 @@ import type { FormErrors, TriggerSelector } from './types';
 
 export interface UseFormOptions<FormValues> {
 	data: Readable<FormValues>;
-	fields?: Record<string, Partial<FieldConfig>>;
+	stringify?: (value: any, name: string, values: FormValues) => string;
+	parse?: (value: string, name: string, values: FormValues) => any;
+	update?: (
+		name: string,
+		prev: FormValues,
+		setter: (values: FormValues, path: string, value: any) => FormValues
+	) => FormValues;
 	get?: typeof defaultGet;
 	logger?: (...values: any[]) => void;
 	onSubmit: (values: FormValues) => Promise<void> | void;
@@ -23,15 +29,16 @@ export interface UseFormOptions<FormValues> {
 	transform?: (value: unknown) => FormValues;
 	validate?: (values: FormValues) => Readable<FormErrors>;
 }
-interface FieldConfig {
-	stringify: (value: any) => string;
-	parse: (value: string) => any;
-}
+type FieldConfig<FormValues> = Required<
+	Pick<UseFormOptions<FormValues>, 'stringify' | 'parse' | 'update'>
+>;
 
 export function useForm<FormValues>({
 	data,
-	fields = {},
 	get = defaultGet,
+	parse = (x) => x,
+	stringify = (x: unknown) => (x === undefined || x === null ? '' : String(x)),
+	update = (_, values) => values,
 	logger = process.env.NODE_ENV === 'production' ? undefined : console.log,
 	onSubmit,
 	set = defaultSet,
@@ -82,7 +89,7 @@ export function useForm<FormValues>({
 			.finally(() => isSubmitting.set(false));
 	}
 
-	const fieldConfigs: Record<string, FieldConfig> = {};
+	const fieldConfigs: Record<string, FieldConfig<FormValues>> = {};
 
 	function setValueInDomFromStore(
 		element: HTMLInputElement | HTMLSelectElement,
@@ -94,42 +101,59 @@ export function useForm<FormValues>({
 
 		// The value should be
 		if (isSelectElement(element) && element.multiple) {
-			const selectedOptions = Array.isArray(value) ? value.map(stringify) : [];
+			const selectedOptions = Array.isArray(value)
+				? value.map((optionValue) => stringify(optionValue, name, values))
+				: [];
 
 			for (const option of element.options) {
 				option.selected = selectedOptions.includes(option.value);
 			}
 		} else {
-			element.value = stringify(value);
+			element.value = stringify(value, name, values);
 		}
 	}
 
 	function setValueInStoreFromDom(property: string, value: string | string[]) {
-		const { parse } = fieldConfigs[property];
+		const { parse, update } = fieldConfigs[property];
 		const current = getStoreValue(current$);
-		const parsedValue = Array.isArray(value) ? value.map(parse) : parse(value);
-		const next = set(current, property, parsedValue);
+		const parsedValue = Array.isArray(value)
+			? value.map((optionValue) => parse(optionValue, property, current))
+			: parse(value, property, current);
+		let next = set(current, property, parsedValue);
 
+		const edited_keys = [property];
+		next = update(property, next, (values, path, value) => {
+			edited_keys.push(path);
+			return set(values, path, value);
+		});
 		if (next === current) return; /* Nothing changed */
 
 		current$.set(next);
 
 		const original = getStoreValue(original$);
-		const originalValue = get(original, property);
-
-		const changed = originalValue !== next;
 		const dirtyFields = getStoreValue(dirtyFields$);
 
-		if (changed && !dirtyFields.includes(property)) {
-			dirtyFields$.set([...dirtyFields, property]);
-		} else if (!changed && dirtyFields.includes(property)) {
-			dirtyFields$.set(dirtyFields.filter((field) => property !== field));
-		}
+		const nextDirtyFields = edited_keys.reduce((acc, edited_key) => {
+			const originalValue = get(original, edited_key);
+			const nextValue = get(next, edited_key);
+			const changed = originalValue !== nextValue;
+			if (changed && !acc.includes(edited_key)) {
+				return [...acc, edited_key];
+			} else if (!changed && acc.includes(edited_key)) {
+				return acc.filter((x) => x !== edited_key);
+			}
+			return acc;
+		}, dirtyFields);
 
-		const touchedFields = getStoreValue(touchedFields$);
-		if (touchedFields.includes(property)) {
-			touchedFields$.set([...touchedFields, property]);
+		if (nextDirtyFields !== dirtyFields) {
+			dirtyFields$.set(nextDirtyFields);
 		}
+		touchedFields$.update((prev) =>
+			edited_keys.reduce((acc, item) => {
+				if (acc.includes(item)) return acc;
+				return [...acc, item];
+			}, prev)
+		);
 	}
 
 	return {
@@ -167,9 +191,10 @@ export function useForm<FormValues>({
 				if (!name) return; // TODO: add logging
 				if (isInputElement(element) || isSelectElement(element)) {
 					logger?.('adding field ', name);
-					fieldConfigs[name] = getFieldConfig(element, {
-						...fields?.[name],
-						...fieldConfigs[name]
+					fieldConfigs[name] = getFieldConfig<FormValues>(element, {
+						stringify,
+						parse,
+						update
 					});
 					const unsubscribe = current$.subscribe((values) => {
 						setValueInDomFromStore(element, values);
@@ -259,7 +284,9 @@ export function useForm<FormValues>({
 			return {
 				destroy() {
 					unsubscribe(subscriptions);
-					for (const fieldSubscriptions of Object.values(formFields)) {
+					subscriptions.length = 0;
+					for (const [key, fieldSubscriptions] of Object.entries(formFields)) {
+						delete formFields[key];
 						unsubscribe(fieldSubscriptions);
 					}
 				}
@@ -268,33 +295,30 @@ export function useForm<FormValues>({
 	};
 }
 
-function getFieldConfig(element: Element, { parse, stringify }: Partial<FieldConfig>) {
+function getFieldConfig<FormValues>(
+	element: Element,
+	{ parse, stringify, update }: FieldConfig<FormValues>
+) {
 	if (parse === undefined) {
-		const defaultParse = (x: string) => x;
 		if (isInputElement(element)) {
 			switch (element.type) {
 				case 'number':
 					parse = parseInt;
 					break;
-				default:
-					parse = defaultParse;
 			}
-		} else {
-			parse = defaultParse;
 		}
-	}
-	if (stringify === undefined) {
-		const defaultStringify = (x: unknown) => (x === undefined || x === null ? '' : String(x));
-		stringify = defaultStringify;
 	}
 	return {
 		parse,
-		stringify
+		stringify,
+		update
 	};
 }
 
 function unsubscribe(subscriptions: Unsubscriber[]) {
-	subscriptions.forEach((x) => x());
+	for (let i = 0; i < subscriptions.length; i++) {
+		subscriptions[i]();
+	}
 }
 
 export const parseInt = (value: string) => {
